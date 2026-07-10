@@ -1,0 +1,320 @@
+name: AudioLink CI and Release
+
+on:
+  push:
+    branches:
+      - main
+      - master
+    tags:
+      - "v*"
+  pull_request:
+    branches:
+      - main
+      - master
+  workflow_dispatch:
+    inputs:
+      tag_name:
+        description: "Release tag, for example v1.0.0. Leave empty to use Flutter/pubspec.yaml."
+        required: false
+        default: ""
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: audiolink-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  FLUTTER_PROJECT_DIR: Flutter
+  RUST_PROJECT_DIR: Rust
+  JAVA_VERSION: "17"
+
+jobs:
+  verify:
+    name: Analyze and Test
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: ${{ env.FLUTTER_PROJECT_DIR }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Set up Java
+        uses: actions/setup-java@v5
+        with:
+          distribution: temurin
+          java-version: ${{ env.JAVA_VERSION }}
+          cache: gradle
+
+      - name: Set up Flutter
+        uses: subosito/flutter-action@v2
+        with:
+          channel: stable
+          cache: true
+
+      - name: Print tool versions
+        run: |
+          flutter --version
+          java -version
+
+      - name: Install dependencies
+        run: flutter pub get
+
+      - name: Analyze
+        run: flutter analyze
+
+      - name: Test
+        run: flutter test
+
+  android-release:
+    name: Build Signed Android Release
+    runs-on: ubuntu-latest
+    needs: verify
+    if: github.event_name != 'pull_request'
+    permissions:
+      contents: read
+    defaults:
+      run:
+        working-directory: ${{ env.FLUTTER_PROJECT_DIR }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Set up Java
+        uses: actions/setup-java@v5
+        with:
+          distribution: temurin
+          java-version: ${{ env.JAVA_VERSION }}
+          cache: gradle
+
+      - name: Set up Flutter
+        uses: subosito/flutter-action@v2
+        with:
+          channel: stable
+          cache: true
+
+      - name: Install dependencies
+        run: flutter pub get
+
+      - name: Prepare Android signing
+        shell: bash
+        env:
+          ANDROID_KEYSTORE_BASE64: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
+          ANDROID_KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
+          ANDROID_KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD }}
+          ANDROID_STORE_PASSWORD: ${{ secrets.ANDROID_STORE_PASSWORD }}
+        run: |
+          set -euo pipefail
+          missing=0
+          for name in ANDROID_KEYSTORE_BASE64 ANDROID_KEY_ALIAS ANDROID_KEY_PASSWORD ANDROID_STORE_PASSWORD; do
+            if [ -z "${!name:-}" ]; then
+              echo "::error::Missing repository secret: $name"
+              missing=1
+            fi
+          done
+          if [ "$missing" -ne 0 ]; then
+            exit 1
+          fi
+
+          umask 077
+          printf '%s' "$ANDROID_KEYSTORE_BASE64" | base64 --decode > android/app/release-keystore.jks
+          {
+            printf 'storeFile=app/release-keystore.jks\n'
+            printf 'storePassword=%s\n' "$ANDROID_STORE_PASSWORD"
+            printf 'keyPassword=%s\n' "$ANDROID_KEY_PASSWORD"
+            printf 'keyAlias=%s\n' "$ANDROID_KEY_ALIAS"
+          } > android/key.properties
+
+      - name: Resolve release version
+        id: release_version
+        shell: bash
+        run: |
+          set -euo pipefail
+          tag_name="${{ inputs.tag_name }}"
+          if [ -z "$tag_name" ] && [ "${GITHUB_REF_TYPE:-}" = "tag" ]; then
+            tag_name="$GITHUB_REF_NAME"
+          fi
+
+          version_name="${tag_name#v}"
+          if [ -z "$tag_name" ]; then
+            version_name="$(sed -nE 's/^version:[[:space:]]*([^+[:space:]]+).*/\1/p' pubspec.yaml | head -n 1)"
+          fi
+
+          if [ -z "$version_name" ]; then
+            echo "::error::Unable to resolve Android versionName"
+            exit 1
+          fi
+
+          echo "tag_name=$tag_name" >> "$GITHUB_OUTPUT"
+          echo "version_name=$version_name" >> "$GITHUB_OUTPUT"
+
+      - name: Build release APK
+        shell: bash
+        run: |
+          set -euo pipefail
+          flutter build apk --release \
+            --build-name "${{ steps.release_version.outputs.version_name }}" \
+            --build-number "$GITHUB_RUN_NUMBER"
+
+      - name: Stage release files
+        shell: bash
+        run: |
+          set -euo pipefail
+          version="${{ steps.release_version.outputs.version_name }}"
+          release_dir="build/release-assets-${GITHUB_RUN_NUMBER}"
+          mkdir -p "$release_dir"
+
+          cp build/app/outputs/flutter-apk/app-release.apk "$release_dir/AudioLink-Android-${version}.apk"
+
+      - name: Upload release artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: audiolink-android-release-${{ github.run_number }}
+          path: Flutter/build/release-assets-${{ github.run_number }}/*
+          if-no-files-found: error
+          retention-days: 30
+
+  rust-windows-release:
+    name: Build Windows Rust Release
+    runs-on: windows-latest
+    needs: verify
+    if: github.event_name != 'pull_request'
+    permissions:
+      contents: read
+    defaults:
+      run:
+        working-directory: ${{ env.RUST_PROJECT_DIR }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Set up Rust
+        shell: pwsh
+        run: |
+          rustup default stable
+          rustc --version
+          cargo --version
+
+      - name: Build release executable
+        run: cargo build --release --locked
+
+      - name: Stage Windows release files
+        shell: pwsh
+        run: |
+          $tagName = "${{ inputs.tag_name }}"
+          if ([string]::IsNullOrWhiteSpace($tagName) -and $env:GITHUB_REF_TYPE -eq "tag") {
+            $tagName = $env:GITHUB_REF_NAME
+          }
+
+          $version = $tagName
+          if ($version.StartsWith("v")) {
+            $version = $version.Substring(1)
+          }
+          if ([string]::IsNullOrWhiteSpace($version)) {
+            $versionLine = Select-String -Path "..\Flutter\pubspec.yaml" -Pattern '^version:\s*([^+\s]+)' | Select-Object -First 1
+            if ($versionLine.Line -match '^version:\s*([^+\s]+)') {
+              $version = $Matches[1]
+            }
+          }
+          if ([string]::IsNullOrWhiteSpace($version)) {
+            $versionLine = Select-String -Path Cargo.toml -Pattern '^version\s*=\s*"([^"]+)"' | Select-Object -First 1
+            if ($versionLine.Line -match '^version\s*=\s*"([^"]+)"') {
+              $version = $Matches[1]
+            }
+          }
+          if ([string]::IsNullOrWhiteSpace($version)) {
+            Write-Error "Unable to resolve Windows release version"
+            exit 1
+          }
+
+          $releaseDir = "target\release-package-$env:GITHUB_RUN_NUMBER"
+          New-Item -ItemType Directory -Force -Path $releaseDir | Out-Null
+
+          $exeName = "AudioLink-Windows-$version.exe"
+          $exePath = "$releaseDir\$exeName"
+          Copy-Item -LiteralPath "target\release\AudioLink.exe" -Destination $exePath
+
+      - name: Upload Windows release artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: audiolink-windows-release-${{ github.run_number }}
+          path: Rust/target/release-package-${{ github.run_number }}/*
+          if-no-files-found: error
+          retention-days: 30
+
+  publish-github-release:
+    name: Publish GitHub Release
+    runs-on: ubuntu-latest
+    needs:
+      - android-release
+      - rust-windows-release
+    if: github.event_name != 'pull_request'
+    permissions:
+      contents: write
+
+    steps:
+      - name: Checkout release metadata
+        uses: actions/checkout@v7
+
+      - name: Download release artifacts
+        uses: actions/download-artifact@v8
+        with:
+          path: dist
+          pattern: audiolink-*-release-${{ github.run_number }}
+          merge-multiple: true
+
+      - name: Create or update GitHub Release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          tag_name="${{ inputs.tag_name }}"
+          if [ -z "$tag_name" ] && [ "${GITHUB_REF_TYPE:-}" = "tag" ]; then
+            tag_name="$GITHUB_REF_NAME"
+          fi
+          if [ -z "$tag_name" ]; then
+            version_name="$(sed -nE 's/^version:[[:space:]]*([^+[:space:]]+).*/\1/p' Flutter/pubspec.yaml | head -n 1)"
+            if [ -n "$version_name" ]; then
+              tag_name="v$version_name"
+            fi
+          fi
+          if [ -z "$tag_name" ]; then
+            echo "::error::Unable to resolve GitHub Release tag"
+            exit 1
+          fi
+
+          {
+            printf 'Audio Link %s\n\n' "$tag_name"
+            printf '%s\n' '- Android APK：用于安装 Android 客户端。'
+            printf '%s\n' '- Windows EXE：Rust 桌面端程序。'
+          } > RELEASE_NOTES.md
+
+          mapfile -t assets < <(find dist -type f | sort)
+          if [ "${#assets[@]}" -eq 0 ]; then
+            echo "::error::No release assets found"
+            exit 1
+          fi
+
+          if gh release view "$tag_name" >/dev/null 2>&1; then
+            mapfile -t stale_assets < <(
+              gh release view "$tag_name" --json assets \
+                --jq '.assets[].name | select((startswith("AudioLink-Android-") and (endswith(".apk") or endswith(".aab"))) or (startswith("AudioLink-Windows-") and (endswith(".exe") or endswith(".zip"))) or startswith("SHA256SUMS-"))'
+            )
+            for stale_asset in "${stale_assets[@]}"; do
+              gh release delete-asset "$tag_name" "$stale_asset" --yes
+            done
+            gh release upload "$tag_name" "${assets[@]}" --clobber
+          else
+            gh release create "$tag_name" "${assets[@]}" \
+              --target "$GITHUB_SHA" \
+              --title "Audio Link $tag_name" \
+              --notes-file RELEASE_NOTES.md
+          fi
