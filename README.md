@@ -15,8 +15,8 @@ Audio Link 是一款局域网无损音频串流工具，可将 Windows 电脑正
 ## 界面预览
 
 <p align="center">
-  <img src="Images/1.png" width="320" alt="Audio Link 服务端扫描界面"/>
-  <img src="Images/5.png" width="320" alt="Audio Link 播放设置界面"/>
+  <img src="Images/1.png" width="320" height="536" alt="Audio Link 服务端扫描界面"/>
+  <img src="Images/5.png" width="320" height="536" alt="Audio Link 播放设置界面"/>
 </p>
 
 ## 开发背景
