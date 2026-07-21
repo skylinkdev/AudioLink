@@ -5,12 +5,19 @@
 <h3>Audio Link</h3>
 
 <p>
-Audio Link 是一款局域网音频串流工具，可将 Windows 电脑正在播放的系统声音实时传输到 Android 设备。它支持自动发现、低延迟播放、缓冲调节，并可在手机端控制电脑音量与媒体播放。
+Audio Link 是一款局域网无损音频串流工具，可将 Windows 电脑正在播放的系统声音以无损、低延迟的方式实时传输到 Android 设备。
 </p>
 
 <br clear="all"/>
 
 ---
+
+## 界面预览
+
+<p align="center">
+  <img src="Images/1.png" width="320" alt="Audio Link 服务端扫描界面"/>
+  <img src="Images/5.png" width="320" alt="Audio Link 播放设置界面"/>
+</p>
 
 ## 开发背景
 
